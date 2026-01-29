@@ -1,0 +1,638 @@
+
+import AVFAudio
+// @preconcurrency required for sending AVAudioPCMBuffer, AVAudioTime
+@preconcurrency import AVFAudio
+import AVFoundation
+import Accelerate
+import Combine
+import CoreAudio
+import SwiftUI
+
+// Power of a specific channel
+//
+// average and peak are expressed in decibels full-scale (dBFS)
+//
+// - min: -160 dB (0.000_000_01)
+// - max: 0 dB (1.0)
+struct PowerLevel: Identifiable, Hashable {
+    let channel: Int
+    let average: Float
+    let peak: Float
+
+    var id: Int {
+        return channel
+    }
+}
+
+// MARK: - Extensions
+extension Float {
+    // decibels full-scale (dBFS)
+    // The returned value ranges from –160 dBFS, indicating minimum power, to 0 dBFS, indicating maximum power.
+    var powerString: String {
+        "\(self.formatted(.number.precision(.fractionLength(0)))) dBFS"
+    }
+
+    var linearPower: Float {
+        pow(10, self / 20)
+    }
+
+    func string(precision: Int) -> String {
+        "\(self.formatted(.number.precision(.fractionLength(precision))))"
+    }
+}
+
+extension UInt32 {
+    var deviceTransportTypeDescription: String {
+        switch self {
+        case kAudioDeviceTransportTypeUnknown:
+            "unknown"
+        case kAudioDeviceTransportTypeBuiltIn:
+            "built in"
+        case kAudioDeviceTransportTypeAggregate:
+            "aggregate"
+        case kAudioDeviceTransportTypeVirtual:
+            "virtual"
+        case kAudioDeviceTransportTypePCI:
+            "PCI"
+        case kAudioDeviceTransportTypeUSB:
+            "USB"
+        case kAudioDeviceTransportTypeFireWire:
+            "FireWire"
+        case kAudioDeviceTransportTypeBluetooth:
+            "Bluetooth"
+        case kAudioDeviceTransportTypeBluetoothLE:
+            "BLE"
+        case kAudioDeviceTransportTypeHDMI:
+            "HDMI"
+        case kAudioDeviceTransportTypeDisplayPort:
+            "DisplayPort"
+        case kAudioDeviceTransportTypeAirPlay:
+            "Airplay"
+        case kAudioDeviceTransportTypeAVB:
+            "AVB"
+        case kAudioDeviceTransportTypeThunderbolt:
+            "Thunderbolt"
+        case kAudioDeviceTransportTypeContinuityCaptureWired:
+            "ContinuityCaptureWired"
+        case kAudioDeviceTransportTypeContinuityCaptureWireless:
+            "ContinuityCaptureWireless"
+        default:
+            "unknown"
+        }
+    }
+}
+
+extension AVAudioPCMBuffer {
+
+    static let kMinLevel: Float = 0.000_000_01  // -160 dB
+    static let kMaxLevel: Float = 1.0  // 0 dB
+
+    // Calculates the average (rms) and peak level of each channel in the PCM buffer and caches data.
+    var powerLevels: [PowerLevel] {
+        var powerLevels: [PowerLevel] = []
+
+        let channelCount = Int(self.format.channelCount)
+        let length = vDSP_Length(self.frameLength)
+
+        if let floatData = self.floatChannelData {
+            for channel in 0..<channelCount {
+                powerLevels.append(
+                    calculatePowers(
+                        data: floatData[channel],
+                        strideFrames: self.stride,
+                        length: length,
+                        channel: channel
+                    )
+                )
+            }
+        } else if let int16Data = self.int16ChannelData {
+            for channel in 0..<channelCount {
+                // Convert the data from int16 to float values before calculating the power values.
+                var floatChannelData: [Float] = Array(
+                    repeating: Float(0.0),
+                    count: Int(self.frameLength)
+                )
+                vDSP_vflt16(
+                    int16Data[channel],
+                    self.stride,
+                    &floatChannelData,
+                    self.stride,
+                    length
+                )
+                var scalar = Float(INT16_MAX)
+                vDSP_vsdiv(
+                    floatChannelData,
+                    self.stride,
+                    &scalar,
+                    &floatChannelData,
+                    self.stride,
+                    length
+                )
+
+                powerLevels.append(
+                    calculatePowers(
+                        data: floatChannelData,
+                        strideFrames: self.stride,
+                        length: length,
+                        channel: channel
+                    )
+                )
+            }
+        } else if let int32Data = self.int32ChannelData {
+            for channel in 0..<channelCount {
+                // Convert the data from int32 to float values before calculating the power values.
+                var floatChannelData: [Float] = Array(
+                    repeating: Float(0.0),
+                    count: Int(self.frameLength)
+                )
+                vDSP_vflt32(
+                    int32Data[channel],
+                    self.stride,
+                    &floatChannelData,
+                    self.stride,
+                    length
+                )
+                var scalar = Float(INT32_MAX)
+                vDSP_vsdiv(
+                    floatChannelData,
+                    self.stride,
+                    &scalar,
+                    &floatChannelData,
+                    self.stride,
+                    length
+                )
+
+                powerLevels.append(
+                    calculatePowers(
+                        data: floatChannelData,
+                        strideFrames: self.stride,
+                        length: length,
+                        channel: channel
+                    )
+                )
+            }
+        }
+        return powerLevels
+    }
+
+    private func calculatePowers(
+        data: UnsafePointer<Float>,
+        strideFrames: Int,
+        length: vDSP_Length,
+        channel: Int
+    ) -> PowerLevel {
+        var max: Float = 0.0
+        vDSP_maxv(data, strideFrames, &max, length)
+        if max < Self.kMinLevel {
+            max = Self.kMinLevel
+        }
+
+        var rms: Float = 0.0
+        vDSP_rmsqv(data, strideFrames, &rms, length)
+        if rms < Self.kMinLevel {
+            rms = Self.kMinLevel
+        }
+
+        return PowerLevel(
+            channel: channel,
+            average: 20.0 * log10(rms),
+            peak: 20.0 * log10(max)
+        )
+    }
+}
+
+extension AVAudioTime {
+    static var machineTimeSeconds: TimeInterval {
+        return Self.seconds(forHostTime: mach_absolute_time())
+    }
+
+    var seconds: TimeInterval {
+        return if self.isHostTimeValid {
+            Self.seconds(forHostTime: self.hostTime)
+        } else {
+            Double(self.sampleTime) / self.sampleRate
+        }
+    }
+}
+
+extension AVAudioInputNode {
+
+    // When the engine renders to and from an audio device, the AVAudioSession category and the availability of hardware determines whether an app performs input (for example, input hardware isn’t available in tvOS).
+    // Check the input node’s input format (specifically, the hardware format) for a nonzero sample rate and channel count to see if input is in an enabled state.
+    nonisolated
+        var isEnabled: Bool
+    {
+        let inputFormat = self.inputFormat(forBus: 0)
+        if inputFormat.sampleRate.isZero || inputFormat.sampleRate.isNaN {
+            return false
+        }
+        if inputFormat.channelCount == 0 {
+            return false
+        }
+        return true
+    }
+}
+
+// MARK: - AudioCapturer Main Implementation
+
+//
+// `nonisolated` required because
+// `installTap(onBus:bufferSize:format:block:)`: https://developer.apple.com/documentation/avfaudio/avaudionode/installtap(onbus:buffersize:format:block:) will crash if called from the main thread
+nonisolated class AudioCapturer {
+
+    var onBuffer: ((AVAudioPCMBuffer) -> Void)?
+
+    let format: AVAudioFormat
+
+    private let audioEngine = AVAudioEngine()
+
+    private let bufferSize: UInt32 = 1024
+
+    init() {
+        self.format = audioEngine.inputNode.outputFormat(forBus: 0)
+    }
+
+    // todo: handle device changes such as using a mic from headset
+    // audioEngine.inputNode.auAudioUnit.setDeviceID()
+    // or maybe instruct users to manage their audio input through System Settings (Apple menu > System Settings > Sound > Input), as the AVAudioEngine will automatically use the system's default input device.
+
+    func startCapturing(deviceId: AUAudioObjectID?) throws {
+        if let deviceId {
+            try audioEngine.inputNode.auAudioUnit.setDeviceID(deviceId)
+        }
+
+        // self.logInfo("\(#function)")
+        try Self.checkRecordingPermission()
+
+        self.audioEngine.reset()
+
+        let inputNode = audioEngine.inputNode
+
+        if !inputNode.isEnabled {
+            throw AudioRecordingError.inputNotEnabled
+        }
+
+        inputNode.removeTap(onBus: 0)
+        inputNode.installTap(
+            onBus: 0,
+            bufferSize: self.bufferSize,
+            format: self.format
+        ) { (buffer: AVAudioPCMBuffer, _: AVAudioTime) in
+            self.onBuffer?(buffer)
+        }
+
+        audioEngine.prepare()
+        try audioEngine.start()
+    }
+
+    func stopCapturing() {
+        audioEngine.stop()
+        audioEngine.inputNode.removeTap(onBus: 0)
+        self.audioEngine.reset()
+    }
+}
+
+// MARK: - Static implementations
+nonisolated extension AudioCapturer {
+    // recording permission is needed when accessing mic
+    static func checkRecordingPermission() throws {
+        let permission = AVAudioApplication.shared.recordPermission
+        switch permission {
+
+        case .undetermined:
+            throw AudioRecordingError.unknownPermission
+
+        case .denied:
+            throw AudioRecordingError.permissionDenied
+
+        case .granted:
+            return
+
+        @unknown default:
+            throw AudioRecordingError.unknownPermission
+        }
+    }
+
+    static func requestRecordPermission() async {
+        // not throwing here because this is intended to be called to prompt for permission instead of showing error
+        let _ = await AVAudioApplication.requestRecordPermission()
+    }
+}
+
+enum AudioRecordingError: Error, LocalizedError {
+
+    case permissionDenied
+    case unknownPermission
+    case inputNotEnabled
+
+    var errorDescription: String? {
+        switch self {
+
+        case .permissionDenied:
+            "Recording Permission Denied."
+        case .unknownPermission:
+            "Unknown Recording Permission."
+
+        // When the engine renders to and from an audio device, the AVAudioSession category and the availability of hardware determines whether an app performs input (for example, input hardware isn't available in tvOS).
+        // Check the input node's input format (specifically, the hardware format) for a nonzero sample rate and channel count to see if input is in an enabled state.
+        case .inputNotEnabled:
+            "Audio Input is not available to use."
+
+        }
+    }
+
+    var recoverySuggestion: String? {
+        switch self {
+        case .permissionDenied, .unknownPermission:
+            "Microphone access required. Please enable in System Settings"
+        default:
+            nil
+        }
+    }
+}
+
+// MARK: - AudioDeviceManager
+
+@Observable
+class AudioDeviceManager {
+
+    var selectedDevice: AVCaptureDevice? = .default(
+        .microphone,
+        for: .audio,
+        position: .unspecified
+    )
+
+    private(set) var devicesAvailable: [(AudioObjectID, AVCaptureDevice)] = []
+
+    private var timerCancellable: AnyCancellable?
+    private let timer = Timer.publish(every: 0.2, on: .main, in: .common)
+
+    init() {
+        self.devicesAvailable = self.getAudioCaptureDevices()
+        self.timerCancellable = self.timer.autoconnect().sink(receiveValue: {
+            [weak self] _ in
+            self?.devicesAvailable = (self?.getAudioCaptureDevices() ?? [])
+                .sorted(by: { first, second in
+                    first.0 < second.0
+                })
+        })
+    }
+
+    deinit {
+        self.timerCancellable?.cancel()
+    }
+
+    func getAudioCaptureDevices() -> [(AudioObjectID, AVCaptureDevice)] {
+        let deviceTypes: [AVCaptureDevice.DeviceType] = [
+            .microphone, .external,
+        ]
+
+        let session = AVCaptureDevice.DiscoverySession(
+            deviceTypes: deviceTypes,
+            mediaType: .audio,
+            position: .unspecified
+        )
+
+        let microphones = session.devices
+
+        var dic: [(AudioObjectID, AVCaptureDevice)] = []
+
+        for microphone in microphones {
+            guard
+                let deviceId = self.uniqueIdToAudioObjectId(microphone.uniqueID)
+            else {
+                continue
+            }
+            dic.append((deviceId, microphone))
+
+        }
+        return dic
+    }
+
+    func uniqueIdToAudioObjectId(_ uid: String) -> AudioObjectID? {
+        var propertyAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyTranslateUIDToDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var cfUID = uid as CFString
+        var deviceID: AudioDeviceID = 0
+        var dataSize = UInt32(MemoryLayout<AudioDeviceID>.size)
+
+        let status = withUnsafeMutablePointer(
+            to: &cfUID,
+            { cfUID in
+                let status = AudioObjectGetPropertyData(
+                    AudioObjectID(kAudioObjectSystemObject),
+                    &propertyAddress,
+                    UInt32(MemoryLayout<CFString?>.size),
+                    cfUID,
+                    &dataSize,
+                    &deviceID
+                )
+                return status
+            }
+        )
+
+        if status == noErr {
+            return deviceID
+        }
+
+        return nil
+
+    }
+}
+
+// MARK: - try it out view
+
+struct AudioDeviceManagementView: View {
+
+    @State private var audioDeviceManager = AudioDeviceManager()
+    private let audioCapturer = AudioCapturer()
+    @State private var powerLevels: [PowerLevel] = []
+    @State private var isRecording: Bool = false
+    var body: some View {
+        ScrollView {
+            VStack(
+                alignment: .leading,
+                spacing: 24,
+                content: {
+                    Text("My Mic Input Source!")
+                        .font(.title2)
+                        .fontWeight(.bold)
+
+                    if self.audioDeviceManager.devicesAvailable.isEmpty {
+                        Text("No Mic Source available!")
+                    }
+
+                    ForEach(self.audioDeviceManager.devicesAvailable, id: \.0) {
+                        (deviceId, captureDevice) in
+                        inputSourceView(id: deviceId, device: captureDevice)
+                    }
+
+                    if audioDeviceManager.selectedDevice != nil {
+                        VStack(
+                            alignment: .leading,
+                            content: {
+                                Text("Record To Try")
+
+                                HStack(spacing: 16) {
+                                    Button(
+                                        action: {
+                                            self.isRecording.toggle()
+                                        },
+                                        label: {
+                                            Text(isRecording ? "Stop" : "Start")
+                                        }
+                                    )
+
+                                    ForEach(powerLevels, id: \.self) { metric in
+                                        let total =
+                                            AVAudioPCMBuffer.kMaxLevel
+                                            - AVAudioPCMBuffer.kMinLevel
+
+                                        let linearAverage = min(
+                                            total,
+                                            metric.average.linearPower
+                                        )
+                                        let linearPeak = min(
+                                            total,
+                                            metric.peak.linearPower
+                                        )
+
+                                        VStack {
+
+                                            Text(
+                                                String(
+                                                    "Channel: \(metric.channel)"
+                                                )
+                                            )
+                                            .font(.subheadline)
+                                            .fontWeight(.semibold)
+                                            .frame(
+                                                maxWidth: .infinity,
+                                                alignment: .leading
+                                            )
+
+                                            ProgressView(
+                                                value: linearAverage,
+                                                total: total,
+                                                label: {
+                                                    Text(
+                                                        "Average Power: \(metric.average.powerString)"
+                                                    )
+                                                    .font(.subheadline)
+                                                    .foregroundStyle(.secondary)
+                                                }
+                                            )
+
+                                            ProgressView(
+                                                value: linearPeak,
+                                                total: total,
+                                                label: {
+                                                    Text(
+                                                        "Peak Power: \(metric.peak.powerString)"
+                                                    )
+                                                    .font(.subheadline)
+                                                    .foregroundStyle(.secondary)
+                                                }
+                                            )
+
+                                        }
+
+                                    }
+
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+
+                            }
+                        )
+                    }
+                }
+            )
+            .scrollTargetLayout()
+            .padding()
+            .padding(.horizontal, 36)
+            .onChange(
+                of: isRecording,
+                initial: true,
+                {
+                    audioCapturer.onBuffer = { buffer in
+                        self.powerLevels = buffer.powerLevels
+                    }
+
+                    if isRecording {
+                        do {
+                            let device = self.audioDeviceManager
+                                .devicesAvailable.first(where: {
+                                    $0.1
+                                        == self.audioDeviceManager
+                                        .selectedDevice
+                                })
+                            try self.audioCapturer.startCapturing(
+                                deviceId: device?.0
+                            )
+                        } catch (let error) {
+                            print(error)
+                        }
+                    } else {
+                        self.audioCapturer.stopCapturing()
+                    }
+                }
+            )
+
+        }
+        .frame(width: 640, height: 360)
+    }
+
+    @ViewBuilder
+    private func inputSourceView(id: AudioObjectID, device: AVCaptureDevice)
+        -> some View
+    {
+        // since we are using inputSource.id for ForEach.id
+        // The view will not be updated even if source.isSelected changes
+        // Therefore, we are comparing it withe the self.manager.selectedSource instead
+        let isSelected = device == self.audioDeviceManager.selectedDevice
+
+        HStack {
+            VStack(
+                alignment: .leading,
+                spacing: 8,
+                content: {
+                    Text("AudioObjectID: \(id)")
+                    Text("UniqueId: \(device.uniqueID)")
+                    Text("Name: \(device.localizedName)")
+                    Text(
+                        "Transport Type: \(UInt32(device.transportType).deviceTransportTypeDescription)"
+                    )
+                }
+            )
+
+            Spacer()
+
+            if !isSelected {
+                Button(
+                    action: {
+                        self.audioDeviceManager.selectedDevice = device
+                    },
+                    label: {
+                        Text("Select")
+                    }
+                )
+                .buttonStyle(.borderedProminent)
+            }
+
+        }
+        .padding()
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 16)
+                .fill(.gray.opacity(0.8))
+                .stroke(.link, style: .init(lineWidth: isSelected ? 2.0 : 0.0))
+                .shadow(radius: 4)
+                .scaleEffect(isSelected ? 1.05 : 1.0)
+        )
+
+    }
+
+}
